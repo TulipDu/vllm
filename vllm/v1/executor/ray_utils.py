@@ -112,7 +112,19 @@ try:
                 # Case where there are no scheduled requests
                 # but may still be finished requests.
                 assert not output or not output.req_ids
-                output = scheduler_output, grammar_output, None
+                # Preserve kv_connector_output if present so it can be
+                # forwarded to the next PP stage for aggregation.
+                kv_out = (
+                    output.kv_connector_output
+                    if output is not None and not output.kv_connector_output.is_empty()
+                    else None
+                )
+                wrapped = (
+                    IntermediateTensors({}, kv_connector_output=kv_out)
+                    if kv_out is not None
+                    else None
+                )
+                output = scheduler_output, grammar_output, wrapped
             elif output is None:
                 output = self.worker.model_runner.sample_tokens(grammar_output)
                 # Ensure outputs crossing Ray compiled DAG are serializable.

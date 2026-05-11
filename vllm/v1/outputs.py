@@ -138,6 +138,59 @@ class KVConnectorOutput:
             and not self.invalid_block_ids
         )
 
+    def merge(self, other: "KVConnectorOutput") -> "KVConnectorOutput":
+        """Merge another KVConnectorOutput into this one.
+
+        Used to aggregate KV connector state across PP stages: the previous
+        stage attaches its output to IntermediateTensors, and the current
+        stage merges it with its own before forwarding to the next stage
+        or reporting to the scheduler.
+
+        All set-valued fields are unioned. Scalar fields use the
+        non-default / max value.
+        """
+        expected_finished_count = max(
+            self.expected_finished_count, other.expected_finished_count
+        )
+
+        if other.is_empty():
+            return KVConnectorOutput(
+                finished_sending=self.finished_sending,
+                finished_recving=self.finished_recving,
+                kv_connector_stats=self.kv_connector_stats,
+                kv_cache_events=self.kv_cache_events,
+                invalid_block_ids=self.invalid_block_ids,
+                expected_finished_count=expected_finished_count,
+            )
+        if self.is_empty():
+            return KVConnectorOutput(
+                finished_sending=other.finished_sending,
+                finished_recving=other.finished_recving,
+                kv_connector_stats=other.kv_connector_stats,
+                kv_cache_events=other.kv_cache_events,
+                invalid_block_ids=other.invalid_block_ids,
+                expected_finished_count=expected_finished_count,
+            )
+
+        finished_sending = (self.finished_sending or set()) | (
+            other.finished_sending or set()
+        )
+        finished_recving = (self.finished_recving or set()) | (
+            other.finished_recving or set()
+        )
+        invalid_block_ids = self.invalid_block_ids | other.invalid_block_ids
+        stats = self.kv_connector_stats or other.kv_connector_stats
+        events = self.kv_cache_events or other.kv_cache_events
+
+        return KVConnectorOutput(
+            finished_sending=finished_sending or None,
+            finished_recving=finished_recving or None,
+            kv_connector_stats=stats,
+            kv_cache_events=events,
+            invalid_block_ids=invalid_block_ids,
+            expected_finished_count=expected_finished_count,
+        )
+
 
 @dataclass
 class ECConnectorOutput:

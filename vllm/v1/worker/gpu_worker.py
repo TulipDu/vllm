@@ -376,8 +376,13 @@ class Worker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
+        from vllm.distributed.parallel_state import get_pp_group
+
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        pp_rank = get_pp_group().rank_in_group
+        tp_size = get_tp_group().world_size
+        global_rank = pp_rank * tp_size + tp_rank
+        return {global_rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

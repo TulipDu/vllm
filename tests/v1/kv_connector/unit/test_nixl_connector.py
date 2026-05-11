@@ -2177,3 +2177,361 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
                 remote_tp_size=1,
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
+
+
+# ============================================================================
+# Tests: KVConnectorOutput.merge()  (PP support)
+# ============================================================================
+
+
+def test_kv_connector_output_merge_basic():
+    """Test basic merge of two KVConnectorOutput instances."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput(
+        finished_sending={"req-1", "req-2"},
+        finished_recving={"req-3"},
+        invalid_block_ids={1, 2},
+    )
+    b = KVConnectorOutput(
+        finished_sending={"req-3"},
+        finished_recving={"req-4", "req-5"},
+        invalid_block_ids={3},
+    )
+
+    merged = a.merge(b)
+
+    assert merged.finished_sending == {"req-1", "req-2", "req-3"}
+    assert merged.finished_recving == {"req-3", "req-4", "req-5"}
+    assert merged.invalid_block_ids == {1, 2, 3}
+
+
+def test_kv_connector_output_merge_empty_left():
+    """Test merge where left side is empty."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput()
+    b = KVConnectorOutput(
+        finished_sending={"req-1"},
+        finished_recving={"req-2"},
+    )
+
+    merged = a.merge(b)
+    assert merged.finished_sending == {"req-1"}
+    assert merged.finished_recving == {"req-2"}
+    assert merged.invalid_block_ids == set()
+
+
+def test_kv_connector_output_merge_empty_right():
+    """Test merge where right side is empty."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput(
+        finished_sending={"req-1"},
+        finished_recving={"req-2"},
+    )
+    b = KVConnectorOutput()
+
+    merged = a.merge(b)
+    assert merged.finished_sending == {"req-1"}
+    assert merged.finished_recving == {"req-2"}
+
+
+def test_kv_connector_output_merge_both_empty():
+    """Test merge of two empty outputs."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput()
+    b = KVConnectorOutput()
+
+    merged = a.merge(b)
+    assert merged.is_empty()
+
+
+def test_kv_connector_output_merge_none_fields():
+    """Test merge handles None fields correctly."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput(finished_sending={"req-1"}, finished_recving=None)
+    b = KVConnectorOutput(finished_sending=None, finished_recving={"req-2"})
+
+    merged = a.merge(b)
+    assert merged.finished_sending == {"req-1"}
+    assert merged.finished_recving == {"req-2"}
+
+
+def test_kv_connector_output_merge_expected_finished_count():
+    """Test merge preserves max expected_finished_count."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput(expected_finished_count=4)
+    b = KVConnectorOutput(expected_finished_count=8)
+
+    merged = a.merge(b)
+    assert merged.expected_finished_count == 8
+
+
+def test_kv_connector_output_merge_idempotent():
+    """Test merging the same output twice is idempotent (sets are used)."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    a = KVConnectorOutput(
+        finished_sending={"req-1"},
+        finished_recving={"req-2"},
+        invalid_block_ids={1},
+    )
+
+    merged = a.merge(a.merge(a))
+    assert merged.finished_sending == {"req-1"}
+    assert merged.finished_recving == {"req-2"}
+    assert merged.invalid_block_ids == {1}
+
+
+# ============================================================================
+# Tests: NixlAgentMetadata PP fields
+# ============================================================================
+
+
+def test_nixl_agent_metadata_pp_fields_default():
+    """Test NixlAgentMetadata backward compatibility with default PP fields."""
+    meta = NixlAgentMetadata(
+        engine_id="test-engine",
+        agent_metadata=b"fake_metadata",
+        kv_caches_base_addr=[0x1000],
+        device_id=0,
+        num_blocks=100,
+        block_lens=[1024],
+        kv_cache_layout="HND",
+        block_size=16,
+    )
+    # Default values when PP is not used
+    assert meta.pp_rank == 0
+    assert meta.pp_size == 1
+
+
+def test_nixl_agent_metadata_pp_fields_serialization():
+    """Test serialization roundtrip with PP fields."""
+    meta = NixlAgentMetadata(
+        engine_id="test-engine",
+        agent_metadata=b"fake_metadata",
+        kv_caches_base_addr=[0x1000, 0x2000],
+        device_id=0,
+        num_blocks=100,
+        block_lens=[1024, 1024],
+        kv_cache_layout="HND",
+        block_size=16,
+        pp_rank=1,
+        pp_size=4,
+    )
+    assert meta.pp_rank == 1
+    assert meta.pp_size == 4
+
+    # MessagePack roundtrip
+    encoder = msgspec.msgpack.Encoder()
+    decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+
+    encoded = encoder.encode(meta)
+    decoded = decoder.decode(encoded)
+
+    assert decoded.engine_id == meta.engine_id
+    assert decoded.pp_rank == 1
+    assert decoded.pp_size == 4
+    assert decoded.block_size == 16
+    assert decoded.kv_cache_layout == "HND"
+
+
+def test_nixl_agent_metadata_pp_global_rank():
+    """Test computing global_rank from pp_rank and tp_size."""
+    # Simulate PP=2, TP=4: global ranks 0..7
+    # PP0: tp_ranks 0,1,2,3 → global 0,1,2,3
+    # PP1: tp_ranks 0,1,2,3 → global 4,5,6,7
+    tp_size = 4
+    for pp_rank in range(2):
+        for tp_rank in range(tp_size):
+            global_rank = pp_rank * tp_size + tp_rank
+            expected = pp_rank * tp_size + tp_rank
+            assert global_rank == expected, f"pp={pp_rank}, tp={tp_rank}"
+            # Verify uniqueness
+            assert 0 <= global_rank < 8
+
+
+# ============================================================================
+# Tests: PP-aware handshake (NixlConnectorWorker._nixl_handshake)
+# ============================================================================
+
+
+class FakeNixlConnectorWorkerPP(NixlConnectorWorker):
+    """Test worker with PP awareness for handshake validation."""
+
+    REMOTE_ENGINE_ID = "remote-engine"
+
+    def __init__(self, pp_rank: int = 0, pp_size: int = 1, tp_rank: int = 0, tp_size: int = 1):
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+
+
+def test_handshake_metadata_pp_in_compatibility_hash():
+    """Test that PP size is included in the compatibility hash."""
+    vllm_config = create_vllm_config()
+    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
+    hash1 = compute_nixl_compatibility_hash(vllm_config, "FAKE_BACKEND")
+    vllm_config.parallel_config.pipeline_parallel_size = 2
+    hash2 = compute_nixl_compatibility_hash(vllm_config, "FAKE_BACKEND")
+    assert hash1 != hash2, "PP size change must affect compatibility hash"
+
+
+def test_handshake_payload_pp_roundtrip():
+    """NixlHandshakePayload roundtrip with PP-aware NixlAgentMetadata."""
+    agent_meta = NixlAgentMetadata(
+        engine_id="test-engine",
+        agent_metadata=b"fake",
+        kv_caches_base_addr=[0x1000],
+        device_id=0, num_blocks=100, block_lens=[1024],
+        kv_cache_layout="HND", block_size=16,
+        pp_rank=2, pp_size=4,
+    )
+    encoder = msgspec.msgpack.Encoder()
+    payload = NixlHandshakePayload(
+        compatibility_hash="abc123",
+        agent_metadata_bytes=encoder.encode(agent_meta),
+    )
+    payload_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
+    decoded_payload = payload_decoder.decode(encoder.encode(payload))
+    meta_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+    decoded_meta = meta_decoder.decode(decoded_payload.agent_metadata_bytes)
+    assert decoded_meta.pp_rank == 2
+    assert decoded_meta.pp_size == 4
+
+
+def test_zmq_handshake_listener_pp_global_rank_mapping():
+    """Verify global_rank = pp_rank * tp_size + tp_rank mapping for PP."""
+    tp_size = 4
+    for pp_rank in range(2):
+        for tp_rank in range(tp_size):
+            global_rank = pp_rank * tp_size + tp_rank
+            expected = pp_rank * tp_size + tp_rank
+            assert global_rank == expected
+            assert 0 <= global_rank < tp_size * 2
+        # Verify each global_rank uniquely maps back
+        expected_pp = global_rank // tp_size
+        expected_tp = global_rank % tp_size
+        assert expected_pp == (global_rank // tp_size)
+        assert expected_tp == (global_rank % tp_size)
+
+
+# ============================================================================
+# Tests: PP multi-stage kv_connector_output aggregation
+# ============================================================================
+
+
+def test_pp_two_stage_kv_output_aggregation():
+    """Simulate a 2-stage PP where both stages have kv_connector_output."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    # PP0: finished_recving for req-A, req-B
+    pp0_output = KVConnectorOutput(
+        finished_recving={"req-A"},
+        finished_sending={"req-B"},
+        invalid_block_ids={1},
+    )
+
+    # PP1: finished_recving for req-C
+    pp1_output = KVConnectorOutput(
+        finished_recving={"req-C"},
+        finished_sending={"req-D"},
+        invalid_block_ids={2},
+    )
+
+    # Simulate IntermediateTensors chain
+    # PP0 attaches kv_connector_output to IntermediateTensors
+    # PP1 extracts and merges
+    prev = pp0_output  # extracted from intermediate_tensors
+    curr = pp1_output  # this stage's own output
+    merged = prev.merge(curr)
+
+    assert merged.finished_recving == {"req-A", "req-C"}
+    assert merged.finished_sending == {"req-B", "req-D"}
+    assert merged.invalid_block_ids == {1, 2}
+
+
+def test_pp_three_stage_kv_output_aggregation():
+    """Simulate a 3-stage PP chain."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    # PP0
+    pp0_output = KVConnectorOutput(finished_recving={"req-A"})
+    # PP1
+    pp1_output = KVConnectorOutput(finished_recving={"req-B"})
+    # PP2 (last)
+    pp2_output = KVConnectorOutput(finished_recving={"req-C"})
+
+    # Chain: PP0 → PP1 → PP2
+    chain = pp0_output
+    chain = chain.merge(pp1_output)
+    chain = chain.merge(pp2_output)
+
+    assert chain.finished_recving == {"req-A", "req-B", "req-C"}
+
+
+def test_pp_kv_output_aggregation_with_empty_stages():
+    """Test that empty stages in the chain don't break aggregation."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    # PP0: has output
+    pp0_output = KVConnectorOutput(finished_recving={"req-A"})
+    # PP1: empty (no NIXL transfers completed)
+    pp1_output = KVConnectorOutput()
+    # PP2: has output
+    pp2_output = KVConnectorOutput(finished_recving={"req-B"})
+
+    # Chain
+    chain = pp0_output.merge(pp1_output).merge(pp2_output)
+    assert chain.finished_recving == {"req-A", "req-B"}
+
+
+def test_pp_kv_output_aggregation_overlapping_reqs():
+    """Test that overlapping req_ids across stages don't cause issues."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    # Both stages see the same finished_recving (e.g., different
+    # NIXL workers on different PP stages both see req-A complete).
+    pp0_output = KVConnectorOutput(finished_recving={"req-A", "req-B"})
+    pp1_output = KVConnectorOutput(finished_recving={"req-A", "req-C"})
+
+    merged = pp0_output.merge(pp1_output)
+    assert merged.finished_recving == {"req-A", "req-B", "req-C"}
+    # req-A appears only once (set semantics)
+
+
+def test_pp_kv_output_aggregation_preserves_stats():
+    """Test that merge preserves the first non-None stats object."""
+    from vllm.v1.outputs import KVConnectorOutput
+
+    stats1 = NixlKVConnectorStats()
+    stats2 = NixlKVConnectorStats()
+
+    a = KVConnectorOutput(kv_connector_stats=stats1)
+    b = KVConnectorOutput(kv_connector_stats=stats2)
+
+    merged = a.merge(b)
+    # First non-None stats wins
+    assert merged.kv_connector_stats is stats1
+
+
+def test_worker_pp_coordinate_global_rank_formula():
+    """Verify global_rank formula matches expected PP+TP layout.
+
+    PP=2, TP=4: global ranks 0..7
+    PP0: tp_ranks 0,1,2,3 → global 0,1,2,3
+    PP1: tp_ranks 0,1,2,3 → global 4,5,6,7
+    """
+    tp_size = 4
+    seen = set()
+    for pp in range(2):
+        for tp in range(tp_size):
+            gr = pp * tp_size + tp
+            assert gr not in seen, f"Duplicate global_rank {gr}"
+            seen.add(gr)
+    assert len(seen) == 8

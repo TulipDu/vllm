@@ -683,6 +683,9 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        # KV connector output forwarded from the previous PP stage via
+        # IntermediateTensors (Ray DAG path). Merged in sample_tokens().
+        self.prev_kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -3265,6 +3268,14 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            # Extract kv_connector_output forwarded from the previous PP stage
+            # (Ray DAG path). Merge it in sample_tokens() so both the previous
+            # and current stage's finished_sending/finished_recving are reported.
+            if intermediate_tensors is not None:
+                self.prev_kv_connector_output = (
+                    intermediate_tensors.kv_connector_output
+                )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -3377,18 +3388,53 @@ class GPUModelRunner(
         self.kv_connector_output = None
 
         if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
+            # PP non-final rank case: this rank's output is NOT reported to
+            # the scheduler in multiproc mode. Forward it to the last PP rank
+            # via send_object so it can be merged and reported.
+            if (
+                not self.broadcast_pp_output
+                and get_pp_group().world_size > 1
+                and kv_connector_output is not None
+            ):
+                get_pp_group().send_object(
+                    kv_connector_output, get_pp_group().world_size - 1
+                )
+
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
+            # kv_connector_output (Ray DAG path: this is attached to
+            # IntermediateTensors that were already returned by execute_model).
             if kv_connector_output.is_empty():
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
             return output
+
+        # Last PP rank: merge outputs from previous stages.
+        if self.prev_kv_connector_output is not None:
+            # Ray DAG path: intermediate_tensors carried the previous
+            # stage's kv_connector_output.
+            kv_connector_output = (
+                self.prev_kv_connector_output.merge(kv_connector_output)
+                if kv_connector_output
+                else self.prev_kv_connector_output
+            )
+            self.prev_kv_connector_output = None
+
+        if not self.broadcast_pp_output and get_pp_group().world_size > 1:
+            # Multiproc path: receive kv_connector_output from all non-last
+            # PP ranks and merge into the final output.
+            for src in range(get_pp_group().world_size - 1):
+                other_output = get_pp_group().recv_object(src)
+                if other_output is not None and not other_output.is_empty():
+                    kv_connector_output = (
+                        other_output.merge(kv_connector_output)
+                        if kv_connector_output
+                        else other_output
+                    )
 
         # Unpack ephemeral state.
         (
