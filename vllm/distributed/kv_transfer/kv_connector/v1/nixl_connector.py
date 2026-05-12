@@ -1050,7 +1050,7 @@ class NixlConnectorWorker:
             for remote_tp_rank in p_remote_ranks:
                 # Build global_rank for PP-aware lookup.
                 # Homogeneous PP: same pp_rank on both sides.
-                target_global_rank = self.pp_rank * remote_pp_size + remote_tp_rank
+                target_global_rank = self.pp_rank * remote_tp_size + remote_tp_rank
                 logger.debug(
                     "Querying metadata on path: %s at global rank %s "
                     "(pp_rank=%s, tp_rank=%s)",
