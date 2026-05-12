@@ -786,6 +786,14 @@ class NixlConnectorScheduler:
             return False, None
 
         if not params.get("do_remote_decode"):
+            # D-side request finished or aborted: ensure internal connector
+            # state is cleaned so the worker does not attempt to load KV
+            # for an already-freed request, which would cause the scheduler
+            # to loop on a stale async KV load.
+            self._reqs_need_recv.pop(request.request_id, None)
+            self._reqs_need_save.pop(request.request_id, None)
+            self._reqs_not_processed.add(request.request_id)
+            self._reqs_need_send.pop(request.request_id, None)
             return False, None
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
@@ -2133,6 +2141,14 @@ class NixlConnectorWorker:
             self._reqs_to_process.discard(req_id)
             # We should never get an abort after setting an expiry timer
             assert req_id not in self._reqs_to_send
+            # Cancel any in-progress NIXL transfers for this request so
+            # the scheduler does not loop waiting for async KV load to
+            # complete on a freed request.
+            self._recving_metadata.pop(req_id, None)
+            if req_id in self._recving_transfers:
+                for handle in self._recving_transfers.pop(req_id):
+                    with contextlib.suppress(Exception):
+                        self.nixl_wrapper.release_xfer_handle(handle)
 
         # Add to requests that are waiting to be read and track expiration.
         for req_id, expiration_time in metadata.reqs_to_send.items():
